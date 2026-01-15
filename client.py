@@ -5,9 +5,13 @@ import json
 import time
 import ssl
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
-DEFAULT_PORT = 5050
+# ===== DEFAULT SETTINGS (Fly) =====
+DEFAULT_HOST = "wispy-breeze-6674.fly.dev"
+DEFAULT_PORT = 443
+DEFAULT_TLS = True
+# =================================
 
 def send_json(sock: socket.socket, obj: dict) -> None:
     data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
@@ -51,40 +55,77 @@ def ask(prompt: str, default: Optional[str] = None) -> str:
         return s if s else default
     return input(f"{prompt}: ").strip()
 
-def main() -> None:
-    print("=" * 50)
-    print(" PY MESSENGER CLIENT ")
-    print("=" * 50)
+def connect(host: str, port: int, use_tls: bool) -> socket.socket:
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(10)
+    raw.connect((host, port))
+    raw.settimeout(None)
 
-    host = ask("Server host (domain or IP)", "127.0.0.1")
+    if not use_tls:
+        return raw
+
+    ctx = ssl.create_default_context()
+    # SNI is important for fly.dev
+    tls_sock = ctx.wrap_socket(raw, server_hostname=host)
+    return tls_sock
+
+def try_connect_with_reason(host: str, port: int, use_tls: bool) -> Tuple[Optional[socket.socket], Optional[str]]:
+    try:
+        sock = connect(host, port, use_tls)
+        return sock, None
+    except socket.gaierror:
+        return None, "Host not found (DNS)."
+    except ConnectionRefusedError:
+        return None, "Connection refused (service not listening / port blocked)."
+    except TimeoutError:
+        return None, "Connection timeout."
+    except ssl.SSLError as e:
+        return None, "TLS error: " + str(e)
+    except Exception as e:
+        return None, "Error: " + str(e)
+
+def prompt_connection_settings() -> Tuple[str, int, bool]:
+    print("\n--- Connection settings ---")
+    host = ask("Server host (domain or IP)", DEFAULT_HOST)
+
     port_str = ask("Port", str(DEFAULT_PORT))
-    name = ask("Your name", "User")
-    use_tls = ask("Use TLS? (y/n)", "n").lower().startswith("y")
-
     try:
         port = int(port_str)
         if not (1 <= port <= 65535):
             raise ValueError
     except Exception:
-        print("[!] Invalid port. Using 5050.")
+        print("[!] Invalid port. Using default.")
         port = DEFAULT_PORT
 
-    print(f"\nConnecting to {host}:{port} as {name} (TLS={'ON' if use_tls else 'OFF'}) ...")
+    tls_str = ask("Use TLS? (y/n)", "y" if DEFAULT_TLS else "n").lower()
+    use_tls = tls_str.startswith("y")
+    return host, port, use_tls
 
-    raw = None
-    sock = None
+def main() -> None:
+    print("=" * 50)
+    print(" PY MESSENGER CLIENT ")
+    print("=" * 50)
 
+    name = ask("Your name", "User")
+
+    # 1) try default connect silently (only name asked)
+    host, port, use_tls = DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TLS
+    print(f"\nConnecting to {host}:{port} (TLS={'ON' if use_tls else 'OFF'}) ...")
+    sock, reason = try_connect_with_reason(host, port, use_tls)
+
+    # 2) if failed -> ask settings and retry until success or user exits
+    while sock is None:
+        print(f"[!] Failed: {reason}")
+        choice = ask("Retry with custom settings? (y/n)", "y").lower()
+        if not choice.startswith("y"):
+            return
+
+        host, port, use_tls = prompt_connection_settings()
+        print(f"\nConnecting to {host}:{port} (TLS={'ON' if use_tls else 'OFF'}) ...")
+        sock, reason = try_connect_with_reason(host, port, use_tls)
+
+    # 3) connected
     try:
-        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw.settimeout(10)
-        raw.connect((host, port))
-        raw.settimeout(None)
-
-        sock = raw
-        if use_tls:
-            ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(raw, server_hostname=host)
-
         send_json(sock, {"type": "hello", "name": name})
 
         t = threading.Thread(target=receiver, args=(sock,), daemon=True)
@@ -107,26 +148,9 @@ def main() -> None:
                 continue
 
             send_json(sock, {"type": "msg", "text": text})
-
-    except ssl.SSLError as e:
-        print(f"[!] TLS error: {e}")
-    except ConnectionRefusedError:
-        print("[!] Connection refused (server not running / port closed).")
-    except socket.gaierror:
-        print("[!] Host not found. Check the address.")
-    except TimeoutError:
-        print("[!] Connection timeout. Server unreachable.")
-    except Exception as e:
-        print(f"[!] Error: {e}")
     finally:
         try:
-            if sock is not None:
-                sock.close()
-        except Exception:
-            pass
-        try:
-            if raw is not None:
-                raw.close()
+            sock.close()
         except Exception:
             pass
 
